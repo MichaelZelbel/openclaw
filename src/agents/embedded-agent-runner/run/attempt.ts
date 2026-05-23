@@ -389,6 +389,7 @@ import {
 import { resolveLlmIdleTimeoutMs, streamWithIdleTimeout } from "./llm-idle-timeout.js";
 import { resolveMessageMergeStrategy } from "./message-merge-strategy.js";
 import { installMessageToolOnlyTerminalHook } from "./message-tool-terminal.js";
+import { wrapStreamFnWithMessageTransform } from "./message-transform-stream-wrapper.js";
 import {
   MID_TURN_PRECHECK_ERROR_MESSAGE,
   isMidTurnPrecheckSignal,
@@ -2790,28 +2791,17 @@ export async function runEmbeddedAttempt(
       // call, including tool continuations. Wrap the stream function so every
       // outbound request sees sanitized messages.
       if (transcriptPolicy.dropThinkingBlocks || transcriptPolicy.dropReasoningFromHistory) {
-        const inner = activeSession.agent.streamFn;
-        activeSession.agent.streamFn = (model, context, options) => {
-          const ctx = context as unknown as { messages?: unknown };
-          const messages = ctx?.messages;
-          if (!Array.isArray(messages)) {
-            return inner(model, context, options);
-          }
-          const reasoningSanitized = transcriptPolicy.dropReasoningFromHistory
-            ? dropReasoningFromHistory(messages as unknown as AgentMessage[])
-            : (messages as unknown as AgentMessage[]);
-          const sanitized = transcriptPolicy.dropThinkingBlocks
-            ? (dropThinkingBlocks(reasoningSanitized) as unknown)
-            : (reasoningSanitized as unknown);
-          if (sanitized === messages) {
-            return inner(model, context, options);
-          }
-          const nextContext = {
-            ...(context as unknown as Record<string, unknown>),
-            messages: sanitized,
-          } as unknown;
-          return inner(model, nextContext as typeof context, options);
-        };
+        activeSession.agent.streamFn = wrapStreamFnWithMessageTransform(
+          activeSession.agent.streamFn,
+          (messages) => {
+            const reasoningSanitized = transcriptPolicy.dropReasoningFromHistory
+              ? dropReasoningFromHistory(messages)
+              : messages;
+            return transcriptPolicy.dropThinkingBlocks
+              ? dropThinkingBlocks(reasoningSanitized)
+              : reasoningSanitized;
+          },
+        );
       }
 
       // Mistral (and other strict providers) reject tool call IDs that don't match their
@@ -2830,57 +2820,34 @@ export async function runEmbeddedAttempt(
         isOpenAIResponsesApi,
       };
       if (shouldApplyReplayToolCallIdSanitizer(replayToolCallIdSanitizerDecision)) {
-        const inner = activeSession.agent.streamFn;
         const mode = replayToolCallIdSanitizerDecision.toolCallIdMode;
-        activeSession.agent.streamFn = (model, context, options) => {
-          const ctx = context as unknown as { messages?: unknown };
-          const messages = ctx?.messages;
-          if (!Array.isArray(messages)) {
-            return inner(model, context, options);
-          }
-          const nextMessages = sanitizeReplayToolCallIdsForStream({
-            messages: messages as AgentMessage[],
-            mode,
-            allowedToolNames: replayAllowedToolNames,
-            preserveNativeAnthropicToolUseIds: transcriptPolicy.preserveNativeAnthropicToolUseIds,
-            preserveReplaySafeThinkingToolCallIds: shouldAllowProviderOwnedThinkingReplay({
-              modelApi: (model as { api?: unknown })?.api as string | null | undefined,
-              policy: transcriptPolicy,
+        activeSession.agent.streamFn = wrapStreamFnWithMessageTransform(
+          activeSession.agent.streamFn,
+          (messages, model) =>
+            sanitizeReplayToolCallIdsForStream({
+              messages,
+              mode,
+              allowedToolNames: replayAllowedToolNames,
+              preserveNativeAnthropicToolUseIds: transcriptPolicy.preserveNativeAnthropicToolUseIds,
+              preserveReplaySafeThinkingToolCallIds: shouldAllowProviderOwnedThinkingReplay({
+                modelApi: (model as { api?: unknown })?.api as string | null | undefined,
+                policy: transcriptPolicy,
+              }),
+              repairToolUseResultPairing: transcriptPolicy.repairToolUseResultPairing,
             }),
-            repairToolUseResultPairing: transcriptPolicy.repairToolUseResultPairing,
-          });
-          if (nextMessages === messages) {
-            return inner(model, context, options);
-          }
-          const nextContext = {
-            ...(context as unknown as Record<string, unknown>),
-            messages: nextMessages,
-          } as unknown;
-          return inner(model, nextContext as typeof context, options);
-        };
+        );
       }
 
       if (isOpenAIResponsesApi) {
-        const inner = activeSession.agent.streamFn;
-        activeSession.agent.streamFn = (model, context, options) => {
-          const ctx = context as unknown as { messages?: unknown };
-          const messages = ctx?.messages;
-          if (!Array.isArray(messages)) {
-            return inner(model, context, options);
-          }
-          // Strip orphaned reasoning blocks first, then fix function-call
-          // pairing — matches the call order in google.ts.
-          const reasoningSanitized = downgradeOpenAIReasoningBlocks(messages as AgentMessage[]);
-          const sanitized = downgradeOpenAIFunctionCallReasoningPairs(reasoningSanitized);
-          if (sanitized === messages) {
-            return inner(model, context, options);
-          }
-          const nextContext = {
-            ...(context as unknown as Record<string, unknown>),
-            messages: sanitized,
-          } as unknown;
-          return inner(model, nextContext as typeof context, options);
-        };
+        activeSession.agent.streamFn = wrapStreamFnWithMessageTransform(
+          activeSession.agent.streamFn,
+          (messages) => {
+            // Strip orphaned reasoning blocks first, then fix function-call
+            // pairing — matches the call order in google.ts.
+            const reasoningSanitized = downgradeOpenAIReasoningBlocks(messages);
+            return downgradeOpenAIFunctionCallReasoningPairs(reasoningSanitized);
+          },
+        );
       }
 
       const innerStreamFn = activeSession.agent.streamFn;
